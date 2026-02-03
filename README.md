@@ -41,7 +41,7 @@ pip install datasets transformers librosa
 from datasets import load_dataset
 
 # Load the dataset from HuggingFace
-dataset = load_dataset("your-username/sukuma-voices")
+dataset = load_dataset("sartifyllc/sukuma-voices")
 
 # Access train and test splits
 train_data = dataset["train"]
