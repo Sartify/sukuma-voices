@@ -1,7 +1,7 @@
 # Sukuma Voices 🎙️
 
 [![License: CC BY 4.0](https://img.shields.io/badge/License-CC%20BY%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by/4.0/)
-[![HuggingFace Dataset](https://img.shields.io/badge/🤗%20HuggingFace-Dataset19H-yellow)](https://huggingface.co/datasets/sartifyllc/Sukuma-Voices)
+[![HuggingFace Dataset](https://img.shields.io/badge/🤗%20HuggingFace-Dataset19Hours-yellow)](https://huggingface.co/datasets/sartifyllc/Sukuma-Voices)
 [![HuggingFace Dataset](https://img.shields.io/badge/🤗%20HuggingFace-DatasetACL-yellow)](https://huggingface.co/datasets/sartifyllc/Sukuma-Voices-ACL)
 [![HuggingFace TTS](https://img.shields.io/badge/🤗%20HuggingFace-ModelTTS-red)](https://huggingface.co/sartifyllc/sukuma-voices-tts)
 [![HuggingFace TTS](https://img.shields.io/badge/🤗%20HuggingFace-ModelASR-gree)](https://huggingface.co/sartifyllc/sukuma-voices-tts)
