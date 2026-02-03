@@ -172,7 +172,7 @@ If you use this dataset in your research, please cite:
 | **Naome Etori** | University of Minnesota - Twin Cities | |
 | **Winnie Mang'eni** | Pawa AI | |
 | **Elizabeth Nyaki** | Pawa AI, Sartify Company Limited | |
-| **Michael S. Mollel** | Pawa AI, Sartify Company Limited | |
+| **Michael S. Mollel** | Pawa AI, Sartify Company Limited |michael.mollel@sartify.com |
 
 ## 🙏 Acknowledgments
 
