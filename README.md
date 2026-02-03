@@ -1,7 +1,7 @@
 # Sukuma Voices 🎙️
 
 [![License: CC BY 4.0](https://img.shields.io/badge/License-CC%20BY%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by/4.0/)
-[![HuggingFace Dataset](https://img.shields.io/badge/🤗%20HuggingFace-Dataset-yellow)](https://huggingface.co/datasets/your-username/sukuma-voices)
+[![HuggingFace Dataset](https://img.shields.io/badge/🤗%20HuggingFace-Dataset-yellow)](https://huggingface.co/datasets/sartifyllc/Sukuma-Voices)
 [![Paper](https://img.shields.io/badge/Paper-ACL%202025-blue)]()
 
 **The first publicly available speech corpus for Sukuma (Kisukuma)**, a Bantu language spoken by approximately 10 million people in northern Tanzania.
