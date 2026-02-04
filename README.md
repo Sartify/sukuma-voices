@@ -144,12 +144,7 @@ python scripts/train_asr.py \
 ### Training TTS
 
 ```bash
-python scripts/train_tts.py \
-    --model_name canopylabs/orpheus-3b-0.1-ft \
-    --dataset_path data/ \
-    --output_dir models/sukuma-tts \
-    --num_epochs 4 \
-    --use_lora True
+python scripts/train_tts.py 
 ```
 
 ## ⚠️ Known Limitations
