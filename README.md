@@ -205,5 +205,5 @@ For questions, collaborations, or feedback, please:
 <p align="center">
   <a href="https://www.sartify.com/">Sartify</a> •
   <a href="https://www.pawa-ai.com/">Pawa AI</a> •
-  <a href="https://huggingface.co/datasets/your-username/sukuma-voices">HuggingFace</a>
+  <a href="https://huggingface.co/sartifyllc">HuggingFace</a>
 </p>
