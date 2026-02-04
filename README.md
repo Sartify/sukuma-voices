@@ -63,18 +63,26 @@ print(train_data[0])
 
 ```python
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
-import librosa
+import torch
 
-# Load processor and model
-processor = WhisperProcessor.from_pretrained("openai/whisper-large-v3")
-model = WhisperForConditionalGeneration.from_pretrained("your-username/sukuma-asr-model")
+# Load model and processor
+model = WhisperForConditionalGeneration.from_pretrained("sartifyllc/sukuma-voices-asr")
+processor = WhisperProcessor.from_pretrained("sartifyllc/sukuma-voices-asr")
 
-# Load and process audio
-audio, sr = librosa.load("path/to/audio.wav", sr=16000)
-input_features = processor(audio, sampling_rate=16000, return_tensors="pt").input_features
+# Load and preprocess audio
+audio_array = ...  # Your audio as numpy array at 16kHz
+
+input_features = processor(
+    audio_array, 
+    sampling_rate=16000, 
+    return_tensors="pt"
+).input_features
 
 # Generate transcription
-predicted_ids = model.generate(input_features)
+with torch.no_grad():
+    predicted_ids = model.generate(input_features)
+
+# Decode
 transcription = processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
 print(transcription)
 ```
