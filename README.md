@@ -85,22 +85,9 @@ print(transcription)
 sukuma-voices/
 ├── README.md
 ├── LICENSE
-├── data/
-│   ├── train/
-│   │   ├── audio/
-│   │   └── transcriptions.csv
-│   └── test/
-│       ├── audio/
-│       └── transcriptions.csv
 ├── scripts/
-│   ├── preprocess.py
-│   ├── train_asr.py
-│   └── train_tts.py
-├── notebooks/
-│   └── exploration.ipynb
-└── configs/
-    ├── asr_config.yaml
-    └── tts_config.yaml
+    ├── train_asr.py
+    └── train_tts.py
 ```
 
 ## 📈 Baseline Results
