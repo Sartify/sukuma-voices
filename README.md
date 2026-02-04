@@ -147,7 +147,8 @@ If you use this dataset in your research, please cite:
   title={Learning from Scarcity: Building and Benchmarking Speech Technology for Sukuma},
   author={Mgonzo, Macton and Oketch, Kezia and Etori, Naome and Mang'eni, Winnie and Nyaki, Elizabeth and Mollel, Michael S.},
   booktitle={Proceedings of the Association for Computational Linguistics},
-  year={2025}
+  year={2025},
+  institution={Brown University, University of Notre Dame, University of Minnesota - Twin Cities, Pawa AI, Sartify Company Limited}
 }
 ```
 
