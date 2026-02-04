@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://github.com/Sartify/sukuma-voices/raw/main/sukuma.png" alt="Sukuma Voices" width="800">
+  <img src="https://github.com/Sartify/sukuma-voices/scripts/raw/main/sukuma.png" alt="Sukuma Voices" width="800">
 </p>
 
 
