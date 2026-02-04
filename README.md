@@ -49,14 +49,10 @@ pip install datasets transformers librosa
 from datasets import load_dataset
 
 # Load the dataset from HuggingFace
-dataset = load_dataset("sartifyllc/sukuma-voices")
-
-# Access train and test splits
-train_data = dataset["train"]
-test_data = dataset["test"]
+dataset = load_dataset("sartifyllc/Sukuma-Voices", split='train')
 
 # View a sample
-print(train_data[0])
+print(dataset[0])
 ```
 
 ### ASR Inference Example
