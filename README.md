@@ -132,12 +132,16 @@ sukuma-voices/
 ### Training ASR
 
 ```bash
-python scripts/train_asr.py 
+export WANDB_API_KEY="your_key"
+export HF_TOKEN="your_token"
+python train_asr.py
 ```
 
 ### Training TTS
 
 ```bash
+export WANDB_API_KEY="your_key"
+export HF_TOKEN="your_token"
 python scripts/train_tts.py 
 ```
 
