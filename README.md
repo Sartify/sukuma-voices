@@ -132,13 +132,7 @@ sukuma-voices/
 ### Training ASR
 
 ```bash
-python scripts/train_asr.py \
-    --model_name openai/whisper-large-v3 \
-    --dataset_path data/ \
-    --output_dir models/sukuma-asr \
-    --num_epochs 4 \
-    --batch_size 2 \
-    --learning_rate 1e-4
+python scripts/train_asr.py 
 ```
 
 ### Training TTS
