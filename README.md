@@ -205,7 +205,7 @@ Please open an issue or submit a pull request to contribute.
 
 For questions, collaborations, or feedback, please:
 - Open an issue on this repository
-- Contact: macton_mgonzo@brown.edu
+- Contact: macton_mgonzo@brown.edu, info@sartify.com
 
 ---
 
