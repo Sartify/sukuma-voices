@@ -1,789 +1,385 @@
-#!/usr/bin/env python3
 """
-Sukuma Voices TTS Training and Inference Pipeline
-==================================================
-
-This script trains a Text-to-Speech (TTS) model for Sukuma language using
-the Orpheus model architecture with LoRA fine-tuning.
-
-Authors: Sukuma Voices Team
-License: CC BY 4.0
-Repository: https://github.com/your-username/sukuma-voices
+Sukuma ASR Training Script
+Fine-tunes Whisper Large V3 for Sukuma speech recognition using Unsloth.
 """
 
 import os
-import logging
-from pathlib import Path
-from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any
+from dataclasses import dataclass
+from typing import Any, Dict, List, Union
 
-import torch
 import numpy as np
-import pandas as pd
-from scipy.io.wavfile import write as write_wav
-from pydub import AudioSegment
-import torchaudio.transforms as T
-from torch.nn.utils.rnn import pad_sequence
-
-from datasets import load_dataset, Dataset
-from transformers import TrainingArguments, Trainer
-from unsloth import FastLanguageModel, is_bfloat16_supported
-from snac import SNAC
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
+import torch
+import tqdm
+import evaluate
+import wandb
+from datasets import Audio, load_dataset
+from transformers import (
+    Seq2SeqTrainer,
+    Seq2SeqTrainingArguments,
+    WhisperForConditionalGeneration,
 )
-logger = logging.getLogger(__name__)
-
+from unsloth import FastModel
 
 # =============================================================================
 # Configuration
 # =============================================================================
 
-@dataclass
-class ModelConfig:
-    """Configuration for model loading and LoRA fine-tuning."""
-    model_name: str = "unsloth/orpheus-3b-0.1-ft"
-    max_seq_length: int = 16384
-    dtype: Optional[str] = None  # Auto-detect (float16 for T4/V100, bfloat16 for Ampere+)
-    load_in_4bit: bool = False
+class Config:
+    # Model settings
+    MODEL_NAME = "unsloth/whisper-large-v3"
+    WHISPER_LANGUAGE = "Swahili"   # this is important
+    WHISPER_TASK = "transcribe"
+    GENERATION_LANGUAGE = "<|sk|>"
     
-    # LoRA configuration
-    lora_r: int = 64
-    lora_alpha: int = 64
-    lora_dropout: float = 0.0
-    lora_target_modules: List[str] = field(default_factory=lambda: [
-        "q_proj", "k_proj", "v_proj", "o_proj",
-        "gate_proj", "up_proj", "down_proj"
-    ])
-
-
-@dataclass
-class TrainingConfig:
-    """Configuration for training parameters."""
-    batch_size: int = 1
-    gradient_accumulation_steps: int = 4
-    num_epochs: int = 4
-    learning_rate: float = 2e-4
-    warmup_ratio: float = 0.1
-    weight_decay: float = 0.01
-    lr_scheduler_type: str = "cosine"
-    logging_steps: int = 10
-    output_dir: str = "outputs"
-    seed: int = 3407
-
-
-@dataclass
-class InferenceConfig:
-    """Configuration for inference parameters."""
-    max_new_tokens: int = 4096
-    temperature: float = 0.6
-    top_p: float = 0.95
-    repetition_penalty: float = 1.1
-    sample_rate: int = 24000
-
-
-@dataclass
-class TokenConfig:
-    """Special token IDs for the model."""
-    tokenizer_length: int = 128256
-    start_of_text: int = 128000
-    end_of_text: int = 128009
+    # Dataset settings
+    DATASET_NAME = "sartifyllc/SUKUMA_VOICE"
+    SAMPLING_RATE = 16000
     
-    @property
-    def start_of_speech(self) -> int:
-        return self.tokenizer_length + 1
+    # Training hyperparameters
+    BATCH_SIZE = 2
+    GRADIENT_ACCUMULATION_STEPS = 4
+    WARMUP_STEPS = 5
+    NUM_EPOCHS = 4
+    LEARNING_RATE = 1e-4
+    WEIGHT_DECAY = 0.01
+    SEED = 3407
     
-    @property
-    def end_of_speech(self) -> int:
-        return self.tokenizer_length + 2
+    # Logging and evaluation
+    LOGGING_STEPS = 500
+    EVAL_STEPS = 200
     
-    @property
-    def start_of_human(self) -> int:
-        return self.tokenizer_length + 3
+    # Output settings
+    OUTPUT_DIR = "outputs"
+    PUSH_TO_HUB = True
+    HUB_MODEL_ID = "sartifyllc/Sukuma-STT"
     
-    @property
-    def end_of_human(self) -> int:
-        return self.tokenizer_length + 4
-    
-    @property
-    def start_of_ai(self) -> int:
-        return self.tokenizer_length + 5
-    
-    @property
-    def end_of_ai(self) -> int:
-        return self.tokenizer_length + 6
-    
-    @property
-    def pad_token(self) -> int:
-        return self.tokenizer_length + 7
-    
-    @property
-    def audio_tokens_start(self) -> int:
-        return self.tokenizer_length + 10
+    # W&B settings
+    WANDB_PROJECT = "Sukuma ASR"
 
 
 # =============================================================================
-# Audio Processing
+# Environment Setup
 # =============================================================================
 
-class AudioProcessor:
-    """Handles audio tokenization and decoding using SNAC codec."""
+def setup_environment():
+    """Configure environment variables."""
+    os.environ["HF_AUDIO_DECODER"] = "soundfile"
+    os.environ["UNSLOTH_COMPILE_DISABLE"] = "1"
+
+
+def setup_wandb(config: Config):
+    """Initialize Weights & Biases logging."""
+    wandb_key = os.environ.get("WANDB_API_KEY")
+    if wandb_key:
+        wandb.login(key=wandb_key)
     
-    def __init__(self, device: str = "cuda"):
-        self.device = device
-        self.target_sample_rate = 24000
-        self.snac_model = None
-        
-    def load_snac_model(self) -> None:
-        """Load the SNAC model for audio encoding/decoding."""
-        logger.info("Loading SNAC model...")
-        self.snac_model = SNAC.from_pretrained("hubertsiuzdak/snac_24khz")
-        self.snac_model = self.snac_model.to(self.device)
-        logger.info("SNAC model loaded successfully")
+    wandb.init(project=config.WANDB_PROJECT)
+    wandb.define_metric("test_in_distribution_wer", step_metric="custom_step")
+    wandb.define_metric("test_out_distribution_wer", step_metric="custom_step")
+
+
+# =============================================================================
+# Model Setup
+# =============================================================================
+
+def load_model(config: Config):
+    """Load and configure the Whisper model."""
+    model, tokenizer = FastModel.from_pretrained(
+        model_name=config.MODEL_NAME,
+        dtype=torch.float32,
+        load_in_4bit=False,
+        auto_model=WhisperForConditionalGeneration,
+        whisper_language=config.WHISPER_LANGUAGE,
+        whisper_task=config.WHISPER_TASK,
+        full_finetuning=True,
+    )
     
-    def move_snac_to_cpu(self) -> None:
-        """Move SNAC model to CPU (useful during inference to save GPU memory)."""
-        if self.snac_model is not None:
-            self.snac_model = self.snac_model.to("cpu")
-            logger.info("SNAC model moved to CPU")
+    model = torch.compiler.disable(model)
+    model.gradient_checkpointing_disable()
     
-    def tokenize_audio(self, waveform: np.ndarray, orig_sr: int) -> List[int]:
-        """
-        Convert audio waveform to discrete acoustic tokens.
-        
-        Args:
-            waveform: Audio waveform as numpy array
-            orig_sr: Original sample rate
-            
-        Returns:
-            List of acoustic token IDs
-        """
-        # Convert to tensor and ensure float32
-        waveform_tensor = torch.from_numpy(waveform).unsqueeze(0).to(dtype=torch.float32)
-        
-        # Resample if necessary
-        if orig_sr != self.target_sample_rate:
-            resampler = T.Resample(orig_sr, self.target_sample_rate)
-            waveform_tensor = resampler(waveform_tensor)
-        
-        # Add batch dimension and move to device
-        waveform_tensor = waveform_tensor.unsqueeze(0).to(self.device)
-        
-        # Encode audio to codes
-        with torch.inference_mode():
-            codes = self.snac_model.encode(waveform_tensor)
-        
-        # Interleave codes from all layers
-        all_codes = []
-        for i in range(codes[0].shape[1]):
-            all_codes.extend([
-                codes[0][0][i].item() + 128266,
-                codes[1][0][2*i].item() + 128266 + 4096,
-                codes[2][0][4*i].item() + 128266 + (2 * 4096),
-                codes[2][0][4*i + 1].item() + 128266 + (3 * 4096),
-                codes[1][0][2*i + 1].item() + 128266 + (4 * 4096),
-                codes[2][0][4*i + 2].item() + 128266 + (5 * 4096),
-                codes[2][0][4*i + 3].item() + 128266 + (6 * 4096),
-            ])
-        
-        return all_codes
+    # Configure generation settings
+    model.generation_config.language = config.GENERATION_LANGUAGE
+    model.generation_config.task = config.WHISPER_TASK
+    model.config.suppress_tokens = []
+    model.generation_config.forced_decoder_ids = None
     
-    def decode_tokens_to_audio(self, code_list: List[int]) -> np.ndarray:
-        """
-        Convert acoustic tokens back to audio waveform.
+    return model, tokenizer
+
+
+# =============================================================================
+# Data Processing
+# =============================================================================
+
+def create_preprocessing_function(tokenizer):
+    """Create a function to preprocess audio examples."""
+    def preprocess(example):
+        audio_array = example["audio"]["array"]
+        sampling_rate = example["audio"]["sampling_rate"]
         
-        Args:
-            code_list: List of acoustic token IDs
-            
-        Returns:
-            Audio waveform as numpy array
-        """
-        # Redistribute codes to three layers
-        layer_1, layer_2, layer_3 = [], [], []
+        features = tokenizer.feature_extractor(
+            audio_array, sampling_rate=sampling_rate
+        )
+        tokenized_text = tokenizer.tokenizer(example["text"])
         
-        for i in range((len(code_list) + 1) // 7):
-            layer_1.append(code_list[7*i])
-            layer_2.append(code_list[7*i + 1] - 4096)
-            layer_3.append(code_list[7*i + 2] - (2 * 4096))
-            layer_3.append(code_list[7*i + 3] - (3 * 4096))
-            layer_2.append(code_list[7*i + 4] - (4 * 4096))
-            layer_3.append(code_list[7*i + 5] - (5 * 4096))
-            layer_3.append(code_list[7*i + 6] - (6 * 4096))
-        
-        codes = [
-            torch.tensor(layer_1).unsqueeze(0),
-            torch.tensor(layer_2).unsqueeze(0),
-            torch.tensor(layer_3).unsqueeze(0)
+        return {
+            "input_features": features.input_features[0],
+            "labels": tokenized_text.input_ids,
+        }
+    return preprocess
+
+
+def load_datasets(config: Config, hf_token: str = None):
+    """Load and prepare training and test datasets."""
+    train_dataset = load_dataset(
+        config.DATASET_NAME, 
+        split="train", 
+        token=hf_token
+    )
+    test_dataset = load_dataset(
+        config.DATASET_NAME, 
+        split="test", 
+        token=hf_token
+    )
+    test_dataset_in = load_dataset(
+        config.DATASET_NAME, 
+        split="test_indistribution_synthesis", 
+        token=hf_token
+    )
+    
+    # Resample audio to target sampling rate
+    train_dataset = train_dataset.cast_column(
+        "audio", Audio(sampling_rate=config.SAMPLING_RATE)
+    )
+    test_dataset = test_dataset.cast_column(
+        "audio", Audio(sampling_rate=config.SAMPLING_RATE)
+    )
+    test_dataset_in = test_dataset_in.cast_column(
+        "audio", Audio(sampling_rate=config.SAMPLING_RATE)
+    )
+    
+    return train_dataset, test_dataset, test_dataset_in
+
+
+def preprocess_datasets(datasets, preprocess_fn, split_names):
+    """Apply preprocessing to all datasets."""
+    processed = {}
+    for dataset, name in zip(datasets, split_names):
+        processed[name] = [
+            preprocess_fn(example) 
+            for example in tqdm.tqdm(dataset, desc=f"Processing {name}")
         ]
-        
-        # Decode to audio
-        audio_hat = self.snac_model.decode(codes)
-        return audio_hat.detach().squeeze().cpu().numpy()
+    return processed
 
 
 # =============================================================================
-# Dataset Processing
+# Metrics and Data Collator
 # =============================================================================
 
-class DatasetProcessor:
-    """Handles dataset loading and preprocessing for TTS training."""
+def create_compute_metrics(tokenizer):
+    """Create a metrics computation function."""
+    metric = evaluate.load("wer")
     
-    def __init__(
-        self,
-        audio_processor: AudioProcessor,
-        tokenizer: Any,
-        token_config: TokenConfig,
-        speaker_tag: str = "<sukuma>"
-    ):
-        self.audio_processor = audio_processor
-        self.tokenizer = tokenizer
-        self.token_config = token_config
-        self.speaker_tag = speaker_tag
+    def compute_metrics(pred):
+        pred_ids = pred.predictions
+        label_ids = pred.label_ids
+        
+        # Handle tuple case (logits, ...)
+        if isinstance(pred_ids, tuple):
+            pred_ids = pred_ids[0]
+        
+        # Convert logits to token IDs
+        if len(pred_ids.shape) == 3:
+            pred_ids = pred_ids.argmax(axis=-1)
+        
+        # Replace -100 with pad token
+        label_ids[label_ids == -100] = tokenizer.pad_token_id
+        
+        # Convert to numpy if needed
+        if hasattr(pred_ids, "cpu"):
+            pred_ids = pred_ids.cpu().numpy()
+        if hasattr(label_ids, "cpu"):
+            label_ids = label_ids.cpu().numpy()
+        
+        # Decode predictions and references
+        pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
+        label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
+        
+        wer = 100 * metric.compute(predictions=pred_str, references=label_str)
+        return {"wer": wer}
     
-    def load_dataset(
-        self,
-        dataset_name: str,
-        split: str = "train",
-        hf_token: Optional[str] = None
-    ) -> Dataset:
-        """Load dataset from HuggingFace Hub."""
-        logger.info(f"Loading dataset: {dataset_name} (split: {split})")
-        dataset = load_dataset(dataset_name, split=split, token=hf_token)
-        logger.info(f"Loaded {len(dataset)} samples")
-        return dataset
-    
-    def _add_audio_codes(self, example: Dict[str, Any]) -> Dict[str, Any]:
-        """Add acoustic codes to a single example."""
-        codes_list = None
-        
-        try:
-            audio_data = example.get("audio")
-            if audio_data and "array" in audio_data:
-                codes_list = self.audio_processor.tokenize_audio(
-                    audio_data["array"],
-                    audio_data["sampling_rate"]
-                )
-        except Exception as e:
-            logger.warning(f"Error tokenizing audio: {e}")
-        
-        example["codes_list"] = codes_list
-        return example
-    
-    def _add_speaker_prefix(self, example: Dict[str, Any]) -> Dict[str, Any]:
-        """Add speaker tag prefix to text."""
-        voice = example.get("voice", "sukuma")
-        example["text"] = f"<{voice}> {example['text']}"
-        return example
-    
-    def _remove_duplicate_frames(self, example: Dict[str, Any]) -> Dict[str, Any]:
-        """Remove consecutive duplicate frames from audio codes."""
-        codes = example["codes_list"]
-        
-        if len(codes) % 7 != 0:
-            raise ValueError("Code list length must be divisible by 7")
-        
-        result = codes[:7]
-        
-        for i in range(7, len(codes), 7):
-            if codes[i] != result[-7]:
-                result.extend(codes[i:i+7])
-        
-        example["codes_list"] = result
-        return example
-    
-    def _create_input_ids(self, example: Dict[str, Any]) -> Dict[str, Any]:
-        """Create model input IDs from text and audio codes."""
-        tc = self.token_config
-        
-        # Tokenize text
-        text_prompt = example["text"]
-        if "source" in example:
-            text_prompt = f"{example['source']}: {text_prompt}"
-        
-        text_ids = self.tokenizer.encode(text_prompt, add_special_tokens=True)
-        text_ids.append(tc.end_of_text)
-        
-        # Construct full input sequence
-        input_ids = (
-            [tc.start_of_human]
-            + text_ids
-            + [tc.end_of_human]
-            + [tc.start_of_ai]
-            + [tc.start_of_speech]
-            + example["codes_list"]
-            + [tc.end_of_speech]
-            + [tc.end_of_ai]
+    return compute_metrics
+
+
+@dataclass
+class DataCollatorSpeechSeq2SeqWithPadding:
+    """Data collator for speech-to-text models with padding."""
+    processor: Any
+
+    def __call__(
+        self, features: List[Dict[str, Union[List[int], torch.Tensor]]]
+    ) -> Dict[str, torch.Tensor]:
+        # Pad input features
+        input_features = [
+            {"input_features": feature["input_features"]} 
+            for feature in features
+        ]
+        batch = self.processor.feature_extractor.pad(
+            input_features, return_tensors="pt"
         )
         
-        example["input_ids"] = input_ids
-        example["labels"] = input_ids
-        example["attention_mask"] = [1] * len(input_ids)
-        
-        return example
-    
-    def prepare_dataset(self, dataset: Dataset) -> Dataset:
-        """
-        Full preprocessing pipeline for the dataset.
-        
-        Args:
-            dataset: Raw dataset with audio and text
-            
-        Returns:
-            Processed dataset ready for training
-        """
-        logger.info("Starting dataset preprocessing...")
-        
-        # Step 1: Tokenize audio
-        logger.info("Step 1/5: Tokenizing audio...")
-        dataset = dataset.map(self._add_audio_codes, remove_columns=["audio"])
-        
-        # Step 2: Add speaker prefix
-        logger.info("Step 2/5: Adding speaker prefixes...")
-        dataset = dataset.map(self._add_speaker_prefix)
-        
-        # Step 3: Filter invalid samples
-        logger.info("Step 3/5: Filtering invalid samples...")
-        initial_count = len(dataset)
-        dataset = dataset.filter(lambda x: x["codes_list"] is not None)
-        dataset = dataset.filter(lambda x: len(x["codes_list"]) > 0)
-        logger.info(f"Filtered {initial_count - len(dataset)} invalid samples")
-        
-        # Step 4: Remove duplicate frames
-        logger.info("Step 4/5: Removing duplicate frames...")
-        dataset = dataset.map(self._remove_duplicate_frames)
-        
-        # Step 5: Create input IDs
-        logger.info("Step 5/5: Creating input IDs...")
-        dataset = dataset.map(
-            self._create_input_ids,
-            remove_columns=["text", "codes_list"]
+        # Pad labels
+        label_features = [
+            {"input_ids": feature["labels"]} 
+            for feature in features
+        ]
+        labels_batch = self.processor.tokenizer.pad(
+            label_features, return_tensors="pt"
         )
         
-        # Keep only required columns
-        columns_to_keep = ["input_ids", "labels", "attention_mask"]
-        columns_to_remove = [c for c in dataset.column_names if c not in columns_to_keep]
-        dataset = dataset.remove_columns(columns_to_remove)
-        
-        # Shuffle dataset
-        dataset = dataset.shuffle(seed=42)
-        
-        logger.info(f"Dataset preprocessing complete. Final size: {len(dataset)} samples")
-        return dataset
-
-
-# =============================================================================
-# Model Management
-# =============================================================================
-
-class TTSModel:
-    """Manages the TTS model loading, training, and inference."""
-    
-    def __init__(self, model_config: ModelConfig, token_config: TokenConfig):
-        self.model_config = model_config
-        self.token_config = token_config
-        self.model = None
-        self.tokenizer = None
-    
-    def load_model(self) -> None:
-        """Load the base model and apply LoRA configuration."""
-        logger.info(f"Loading model: {self.model_config.model_name}")
-        
-        self.model, self.tokenizer = FastLanguageModel.from_pretrained(
-            model_name=self.model_config.model_name,
-            max_seq_length=self.model_config.max_seq_length,
-            dtype=self.model_config.dtype,
-            load_in_4bit=self.model_config.load_in_4bit,
+        # Mask padding tokens in labels
+        labels = labels_batch["input_ids"].masked_fill(
+            labels_batch.attention_mask.ne(1), -100
         )
         
-        logger.info("Applying LoRA configuration...")
-        self.model = FastLanguageModel.get_peft_model(
-            self.model,
-            r=self.model_config.lora_r,
-            target_modules=self.model_config.lora_target_modules,
-            lora_alpha=self.model_config.lora_alpha,
-            lora_dropout=self.model_config.lora_dropout,
-            bias="none",
-            use_gradient_checkpointing="unsloth",
-            random_state=3407,
-            use_rslora=False,
-            loftq_config=None,
-        )
+        # Remove BOS token if present at start of all sequences
+        if (labels[:, 0] == self.processor.tokenizer.bos_token_id).all().cpu().item():
+            labels = labels[:, 1:]
         
-        logger.info("Model loaded successfully")
-    
-    def _create_data_collator(self):
-        """Create custom data collator for batching."""
-        pad_token = self.token_config.pad_token
-        
-        def collator(features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-            input_ids = [torch.tensor(f["input_ids"], dtype=torch.long) for f in features]
-            attention_mask = [torch.tensor(f["attention_mask"], dtype=torch.long) for f in features]
-            labels = [torch.tensor(f["labels"], dtype=torch.long) for f in features]
-            
-            return {
-                "input_ids": pad_sequence(input_ids, batch_first=True, padding_value=pad_token),
-                "attention_mask": pad_sequence(attention_mask, batch_first=True, padding_value=0),
-                "labels": pad_sequence(labels, batch_first=True, padding_value=-100),
-            }
-        
-        return collator
-    
-    def train(self, dataset: Dataset, training_config: TrainingConfig) -> None:
-        """
-        Train the model on the prepared dataset.
-        
-        Args:
-            dataset: Preprocessed dataset
-            training_config: Training hyperparameters
-        """
-        logger.info("Starting training...")
-        
-        training_args = TrainingArguments(
-            per_device_train_batch_size=training_config.batch_size,
-            gradient_accumulation_steps=training_config.gradient_accumulation_steps,
-            warmup_ratio=training_config.warmup_ratio,
-            num_train_epochs=training_config.num_epochs,
-            learning_rate=training_config.learning_rate,
-            fp16=not is_bfloat16_supported(),
-            bf16=is_bfloat16_supported(),
-            logging_steps=training_config.logging_steps,
-            optim="adamw_8bit",
-            weight_decay=training_config.weight_decay,
-            lr_scheduler_type=training_config.lr_scheduler_type,
-            seed=training_config.seed,
-            output_dir=training_config.output_dir,
-            report_to="none",
-        )
-        
-        trainer = Trainer(
-            model=self.model,
-            train_dataset=dataset,
-            data_collator=self._create_data_collator(),
-            args=training_args,
-        )
-        
-        trainer.train()
-        logger.info("Training complete")
-    
-    def prepare_for_inference(self) -> None:
-        """Prepare model for inference mode."""
-        FastLanguageModel.for_inference(self.model)
-        logger.info("Model prepared for inference")
-    
-    def generate(
-        self,
-        text: str,
-        inference_config: InferenceConfig,
-        speaker_tag: str = "<sukuma>"
-    ) -> Optional[List[int]]:
-        """
-        Generate audio codes from text.
-        
-        Args:
-            text: Input text to synthesize
-            inference_config: Inference parameters
-            speaker_tag: Speaker identifier tag
-            
-        Returns:
-            List of audio codes or None if generation failed
-        """
-        # Prepare input
-        prompt = f"{speaker_tag} {text}"
-        input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids
-        
-        # Add special tokens
-        start_token = torch.tensor([[128259]], dtype=torch.int64)
-        end_tokens = torch.tensor([[128009, 128260]], dtype=torch.int64)
-        modified_input_ids = torch.cat([start_token, input_ids, end_tokens], dim=1)
-        
-        # Move to GPU
-        input_ids_cuda = modified_input_ids.to("cuda")
-        attention_mask = torch.ones_like(input_ids_cuda)
-        
-        # Generate
-        generated_ids = self.model.generate(
-            input_ids=input_ids_cuda,
-            attention_mask=attention_mask,
-            max_new_tokens=inference_config.max_new_tokens,
-            do_sample=True,
-            temperature=inference_config.temperature,
-            top_p=inference_config.top_p,
-            repetition_penalty=inference_config.repetition_penalty,
-            num_return_sequences=1,
-            eos_token_id=128258,
-            use_cache=True,
-        )
-        
-        # Extract audio codes
-        token_to_find = 128257
-        token_to_remove = 128258
-        
-        token_indices = (generated_ids == token_to_find).nonzero(as_tuple=True)
-        
-        if len(token_indices[1]) > 0:
-            last_idx = token_indices[1][-1].item()
-            cropped_tensor = generated_ids[:, last_idx + 1:]
-        else:
-            cropped_tensor = generated_ids
-        
-        # Process codes
-        row = cropped_tensor[0]
-        masked_row = row[row != token_to_remove]
-        
-        # Trim to multiple of 7
-        row_length = masked_row.size(0)
-        new_length = (row_length // 7) * 7
-        trimmed_row = masked_row[:new_length]
-        code_list = [t.item() - 128266 for t in trimmed_row]
-        
-        return code_list if len(code_list) > 0 else None
-    
-    def save_model(self, output_path: str, push_to_hub: bool = False, hub_path: str = None) -> None:
-        """Save the trained model."""
-        logger.info(f"Saving model to {output_path}")
-        self.model.save_pretrained_merged(output_path, self.tokenizer, save_method="merged_16bit")
-        
-        if push_to_hub and hub_path:
-            logger.info(f"Pushing model to HuggingFace Hub: {hub_path}")
-            self.model.push_to_hub_merged(hub_path, self.tokenizer, save_method="merged_16bit")
+        batch["labels"] = labels
+        return batch
 
 
 # =============================================================================
-# Audio I/O Utilities
+# Training
 # =============================================================================
 
-class AudioIO:
-    """Handles audio file reading and writing."""
-    
-    @staticmethod
-    def save_as_wav(audio_data: np.ndarray, sample_rate: int, output_path: str) -> None:
-        """Save audio data as WAV file."""
-        write_wav(output_path, sample_rate, audio_data)
-    
-    @staticmethod
-    def save_as_mp3(audio_data: np.ndarray, sample_rate: int, output_path: str) -> None:
-        """Save audio data as MP3 file."""
-        temp_wav = output_path.replace('.mp3', '_temp.wav')
-        write_wav(temp_wav, sample_rate, audio_data)
-        
-        audio_segment = AudioSegment.from_wav(temp_wav)
-        audio_segment.export(output_path, format="mp3")
-        
-        os.remove(temp_wav)
+def create_training_args(config: Config) -> Seq2SeqTrainingArguments:
+    """Create training arguments."""
+    return Seq2SeqTrainingArguments(
+        output_dir=config.OUTPUT_DIR,
+        per_device_train_batch_size=config.BATCH_SIZE,
+        gradient_accumulation_steps=config.GRADIENT_ACCUMULATION_STEPS,
+        warmup_steps=config.WARMUP_STEPS,
+        num_train_epochs=config.NUM_EPOCHS,
+        learning_rate=config.LEARNING_RATE,
+        weight_decay=config.WEIGHT_DECAY,
+        optim="adamw_8bit",
+        lr_scheduler_type="linear",
+        logging_steps=config.LOGGING_STEPS,
+        eval_steps=config.EVAL_STEPS,
+        eval_strategy="steps",
+        seed=config.SEED,
+        remove_unused_columns=False,
+        label_names=["labels"],
+        report_to="wandb",
+    )
 
 
-# =============================================================================
-# Evaluation Pipeline
-# =============================================================================
+def print_gpu_stats(phase: str = "current"):
+    """Print GPU memory statistics."""
+    if not torch.cuda.is_available():
+        print("CUDA not available")
+        return 0, 0
+    
+    gpu_stats = torch.cuda.get_device_properties(0)
+    reserved_memory = round(torch.cuda.max_memory_reserved() / 1024**3, 3)
+    max_memory = round(gpu_stats.total_memory / 1024**3, 3)
+    
+    print(f"\n{'='*50}")
+    print(f"GPU Stats ({phase})")
+    print(f"{'='*50}")
+    print(f"GPU: {gpu_stats.name}")
+    print(f"Max memory: {max_memory} GB")
+    print(f"Reserved memory: {reserved_memory} GB")
+    
+    return reserved_memory, max_memory
 
-class EvaluationPipeline:
-    """Handles batch evaluation and audio generation for test sets."""
+
+def print_training_summary(trainer_stats, start_memory, max_memory):
+    """Print training summary statistics."""
+    used_memory = round(torch.cuda.max_memory_reserved() / 1024**3, 3)
+    training_memory = round(used_memory - start_memory, 3)
     
-    def __init__(
-        self,
-        model: TTSModel,
-        audio_processor: AudioProcessor,
-        inference_config: InferenceConfig
-    ):
-        self.model = model
-        self.audio_processor = audio_processor
-        self.inference_config = inference_config
-    
-    def evaluate_test_set(
-        self,
-        test_dataset: Dataset,
-        original_output_dir: str = "indistribution_original",
-        synthesis_output_dir: str = "indistribution_synthesis",
-        results_csv: str = "test_generation_results.csv"
-    ) -> pd.DataFrame:
-        """
-        Evaluate model on test set and save generated audio.
-        
-        Args:
-            test_dataset: Test dataset with audio and text
-            original_output_dir: Directory for original audio files
-            synthesis_output_dir: Directory for synthesized audio files
-            results_csv: Path for results CSV file
-            
-        Returns:
-            DataFrame with evaluation results
-        """
-        # Create output directories
-        Path(original_output_dir).mkdir(parents=True, exist_ok=True)
-        Path(synthesis_output_dir).mkdir(parents=True, exist_ok=True)
-        
-        results = []
-        total_samples = len(test_dataset)
-        
-        logger.info(f"Evaluating {total_samples} test samples...")
-        
-        for i, sample in enumerate(test_dataset):
-            try:
-                logger.info(f"Processing [{i+1}/{total_samples}]: {sample['filename']}")
-                
-                # Save original audio
-                original_audio = sample['audio']
-                original_audio_data = np.asarray(original_audio['array'], dtype=np.float32)
-                original_sr = original_audio['sampling_rate']
-                
-                original_path = os.path.join(original_output_dir, f"{sample['filename']}.mp3")
-                AudioIO.save_as_mp3(original_audio_data, original_sr, original_path)
-                
-                # Generate synthesized audio
-                code_list = self.model.generate(sample['text'], self.inference_config)
-                
-                if code_list:
-                    synthesized_audio = self.audio_processor.decode_tokens_to_audio(code_list)
-                    synthesis_path = os.path.join(synthesis_output_dir, f"{sample['filename']}.mp3")
-                    AudioIO.save_as_mp3(synthesized_audio, self.inference_config.sample_rate, synthesis_path)
-                    
-                    results.append({
-                        'original_audio_path': original_path,
-                        'synthesis_audio_path': synthesis_path,
-                        'text': sample['text'],
-                        'filename': sample['filename'],
-                        'record_id': sample['record_id']
-                    })
-                else:
-                    logger.warning(f"Failed to generate audio for: {sample['filename']}")
-                
-                # Save progress periodically
-                if (i + 1) % 100 == 0:
-                    pd.DataFrame(results).to_csv('progress_results.csv', index=False)
-                    logger.info(f"Progress saved: {i+1}/{total_samples} completed")
-                    
-            except Exception as e:
-                logger.error(f"Error processing sample {i+1}: {e}")
-                continue
-        
-        # Save final results
-        df_results = pd.DataFrame(results)
-        df_results.to_csv(results_csv, index=False)
-        
-        logger.info(f"Evaluation complete. Generated {len(results)} audio files.")
-        logger.info(f"Results saved to: {results_csv}")
-        
-        return df_results
+    print(f"\n{'='*50}")
+    print("Training Summary")
+    print(f"{'='*50}")
+    print(f"Training time: {trainer_stats.metrics['train_runtime']:.2f} seconds")
+    print(f"Training time: {trainer_stats.metrics['train_runtime']/60:.2f} minutes")
+    print(f"Peak memory: {used_memory} GB ({used_memory/max_memory*100:.1f}%)")
+    print(f"Training memory: {training_memory} GB ({training_memory/max_memory*100:.1f}%)")
 
 
 # =============================================================================
-# Main Execution
+# Main
 # =============================================================================
 
 def main():
-    """Main execution pipeline."""
+    """Main training function."""
+    config = Config()
     
-    # Set GPU
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    # Get tokens from environment variables
+    hf_token = os.environ.get("HF_TOKEN")
     
-    # Initialize configurations
-    model_config = ModelConfig()
-    training_config = TrainingConfig()
-    inference_config = InferenceConfig()
-    token_config = TokenConfig()
+    # Setup
+    setup_environment()
+    setup_wandb(config)
     
-    # =========================================================================
-    # Phase 1: Model and Data Preparation
-    # =========================================================================
+    # Load model
+    print("Loading model...")
+    model, tokenizer = load_model(config)
     
-    logger.info("=" * 60)
-    logger.info("PHASE 1: Model and Data Preparation")
-    logger.info("=" * 60)
+    # Load and preprocess data
+    print("Loading datasets...")
+    train_data, test_data, test_data_in = load_datasets(config, hf_token)
     
-    # Load TTS model
-    tts_model = TTSModel(model_config, token_config)
-    tts_model.load_model()
-    
-    # Load audio processor
-    audio_processor = AudioProcessor(device="cuda")
-    audio_processor.load_snac_model()
-    
-    # Load and prepare dataset
-    dataset_processor = DatasetProcessor(
-        audio_processor=audio_processor,
-        tokenizer=tts_model.tokenizer,
-        token_config=token_config
+    print("Preprocessing datasets...")
+    preprocess_fn = create_preprocessing_function(tokenizer)
+    processed = preprocess_datasets(
+        datasets=[train_data, test_data, test_data_in],
+        preprocess_fn=preprocess_fn,
+        split_names=["train", "test_out", "test_in"]
     )
     
-    raw_dataset = dataset_processor.load_dataset(
-        dataset_name="sartifyllc/SUKUMA_VOICE",
-        split="train",
-        hf_token="YOUR_HF_TOKEN_HERE"  # Replace with your token
+    # Create trainer components
+    data_collator = DataCollatorSpeechSeq2SeqWithPadding(processor=tokenizer)
+    compute_metrics = create_compute_metrics(tokenizer)
+    training_args = create_training_args(config)
+    
+    # Initialize trainer
+    trainer = Seq2SeqTrainer(
+        model=model,
+        train_dataset=processed["train"],
+        eval_dataset={
+            "test_out_distribution": processed["test_out"],
+            "test_in_distribution": processed["test_in"],
+        },
+        data_collator=data_collator,
+        tokenizer=tokenizer.feature_extractor,
+        compute_metrics=compute_metrics,
+        args=training_args,
     )
     
-    # Print dataset info
-    sample = raw_dataset[0]
-    logger.info(f"Sample rate: {sample['audio']['sampling_rate']} Hz")
-    logger.info(f"Audio shape: {sample['audio']['array'].shape}")
-    logger.info(f"Duration: {len(sample['audio']['array']) / sample['audio']['sampling_rate']:.2f}s")
+    # Print initial GPU stats
+    start_memory, max_memory = print_gpu_stats("before training")
     
-    # Prepare dataset for training
-    prepared_dataset = dataset_processor.prepare_dataset(raw_dataset)
+    # Train
+    print("\nStarting training...")
+    trainer_stats = trainer.train()
     
-    # =========================================================================
-    # Phase 2: Training
-    # =========================================================================
+    # Evaluate
+    print("\nRunning final evaluation...")
+    eval_results = trainer.evaluate(eval_dataset=processed["test_out"])
+    print(f"Test WER (out-of-distribution): {eval_results['eval_wer']:.2f}%")
     
-    logger.info("=" * 60)
-    logger.info("PHASE 2: Training")
-    logger.info("=" * 60)
+    # Print training summary
+    print_training_summary(trainer_stats, start_memory, max_memory)
     
-    tts_model.train(prepared_dataset, training_config)
+    # Push to Hub
+    if config.PUSH_TO_HUB and hf_token:
+        print(f"\nPushing model to Hub: {config.HUB_MODEL_ID}")
+        model.push_to_hub(config.HUB_MODEL_ID, tokenizer, token=hf_token)
     
-    # =========================================================================
-    # Phase 3: Inference Demo
-    # =========================================================================
-    
-    logger.info("=" * 60)
-    logger.info("PHASE 3: Inference Demo")
-    logger.info("=" * 60)
-    
-    # Prepare for inference
-    tts_model.prepare_for_inference()
-    audio_processor.move_snac_to_cpu()
-    
-    # Generate sample audio
-    test_text = 'Hunagwene oyombaga giki, "nene nalinajo ijilanga."'
-    
-    logger.info(f"Generating audio for: {test_text}")
-    code_list = tts_model.generate(test_text, inference_config)
-    
-    if code_list:
-        audio_data = audio_processor.decode_tokens_to_audio(code_list)
-        
-        output_dir = Path("output_audio")
-        output_dir.mkdir(exist_ok=True)
-        output_path = output_dir / "demo_output.wav"
-        
-        AudioIO.save_as_wav(audio_data, inference_config.sample_rate, str(output_path))
-        logger.info(f"Demo audio saved to: {output_path}")
-    
-    # =========================================================================
-    # Phase 4: Test Set Evaluation
-    # =========================================================================
-    
-    logger.info("=" * 60)
-    logger.info("PHASE 4: Test Set Evaluation")
-    logger.info("=" * 60)
-    
-    # Load test dataset
-    test_dataset = load_dataset(
-        'sartifyllc/SUKUMA_VOICE',
-        split="test",
-        token="YOUR_HF_TOKEN_HERE"  # Replace with your token
-    )
-    
-    # Run evaluation
-    evaluation = EvaluationPipeline(tts_model, audio_processor, inference_config)
-    results_df = evaluation.evaluate_test_set(test_dataset)
-    
-    logger.info("=" * 60)
-    logger.info("Pipeline Complete!")
-    logger.info("=" * 60)
+    print("\nTraining complete!")
 
 
 if __name__ == "__main__":
